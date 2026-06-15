@@ -10,6 +10,7 @@ dist/
 # Runtime state
 .telecodex/
 telecodex.log
+telecodex.err.log
 
 # Runtime workspace (Docker mount)
 workspace/

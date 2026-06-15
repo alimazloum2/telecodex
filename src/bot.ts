@@ -1,6 +1,7 @@
+import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { readFile, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { hostname, tmpdir, uptime } from "node:os";
 import path from "node:path";
 
 import { autoRetry } from "@grammyjs/auto-retry";
@@ -38,8 +39,15 @@ import type { TeleCodexConfig, ToolVerbosity } from "./config.js";
 import { contextKeyFromCtx, isTopicContextKey, parseContextKey, type TelegramContextKey } from "./context-key.js";
 import { friendlyErrorText } from "./error-messages.js";
 import { escapeHTML, formatTelegramHTML } from "./format.js";
+import {
+  MACMINI_CALLBACK_PREFIX,
+  buildMacminiKeyboard,
+  getMacminiAction,
+} from "./macmini/registry.js";
+import { handlePriceLookup } from "./pricebook.js";
 import { SessionRegistry } from "./session-registry.js";
 import { getAvailableBackends, transcribeAudio } from "./voice.js";
+import { runYouTubeWorkflow } from "./youtube.js";
 
 const TELEGRAM_MESSAGE_LIMIT = 4000;
 const EDIT_DEBOUNCE_MS = 1500;
@@ -51,10 +59,30 @@ const MAX_AUDIO_FILE_SIZE = 25 * 1024 * 1024;
 const KEYBOARD_PAGE_SIZE = 6;
 const NOOP_PAGE_CALLBACK_DATA = "noop_page";
 const LAUNCH_PROFILES_COMMAND = "/launch_profiles";
+const REMOTE_CAPTURE_TIMEOUT_MS = 20_000;
+const REMOTE_CAPTURE_CAMERA_DEVICE_INDEX = 0; // ffmpeg avfoundation: HD Pro Webcam C920
+const REMOTE_CAPTURE_AUDIO_DEVICE_INDEX = 0; // ffmpeg avfoundation: Razer Seiren Mini
+const REMOTE_CAPTURE_SCREENSHOT_PATH = "/tmp/hermes_shot.png";
+const REMOTE_CAPTURE_VIDEO_PATH = "/tmp/hermes_vid.mp4";
+const REMOTE_CAPTURE_AUDIO_PATH = "/tmp/hermes_audio.m4a";
+const DEFAULT_SECONDS = 10;
+const GUARD_DURATION_OPTIONS = [10, 20, 30, 60] as const;
+const CAM_INDEX = 0; // ffmpeg avfoundation: HD Pro Webcam C920
+const MIC_INDEX = 0; // ffmpeg avfoundation: Razer Seiren Mini
+const GUARD_MAX_UPLOAD_BYTES = 45 * 1024 * 1024;
+const GUARD_SCREENSHOT_PATH = "/tmp/guard_shot.png";
+const GUARD_VIDEO_PATH = "/tmp/guard_vid.mp4";
+const GUARD_VIDEO_SMALL_PATH = "/tmp/guard_vid_small.mp4";
+const GUARD_AUDIO_PATH = "/tmp/guard_audio.ogg";
+const GUARD_AUDIO_SMALL_PATH = "/tmp/guard_audio_small.ogg";
+
 
 type TelegramChatId = number | string;
 type TelegramParseMode = "HTML";
 type KeyboardItem = { label: string; callbackData: string };
+type RemoteCaptureKind = "screenshot" | "video" | "audio";
+type GuardCaptureKind = "screenshot" | "video" | "voice";
+
 
 type ToolState = {
   toolName: string;
@@ -107,6 +135,22 @@ function paginateKeyboard(items: KeyboardItem[], page: number, prefix: string): 
   return keyboard;
 }
 
+function buildGuardKeyboard(seconds: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text("📷 Screenshot", "guard_screenshot")
+    .text("🎥 Record Video", "guard_video")
+    .row()
+    .text("🎙️ Record Voice", "guard_voice")
+    .text(`⏱️ Duration: ${seconds}s`, "guard_duration")
+    .row()
+    .text("✕ Cancel", "guard_cancel");
+}
+
+function nextGuardDuration(seconds: number): number {
+  const index = GUARD_DURATION_OPTIONS.findIndex((value) => value === seconds);
+  return GUARD_DURATION_OPTIONS[(index + 1) % GUARD_DURATION_OPTIONS.length] ?? DEFAULT_SECONDS;
+}
+
 export function createBot(config: TeleCodexConfig, registry: SessionRegistry): Bot<Context> {
   const bot = new Bot<Context>(config.telegramBotToken);
   bot.api.config.use(autoRetry({ maxRetryAttempts: 3, maxDelaySeconds: 10 }));
@@ -124,6 +168,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   const pendingUnsafeLaunchConfirmations = new Map<TelegramContextKey, string>();
   const pendingModelButtons = new Map<TelegramContextKey, KeyboardItem[]>();
   const pendingEffortButtons = new Map<TelegramContextKey, KeyboardItem[]>();
+  const pendingGuardDurations = new Map<TelegramContextKey, number>();
   const lastPromptInput = new Map<TelegramContextKey, CodexPromptInput>();
 
   registry.onRemove((key) => {
@@ -131,6 +176,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     pendingLaunchPicks.delete(key);
     pendingLaunchButtons.delete(key);
     pendingUnsafeLaunchConfirmations.delete(key);
+    pendingGuardDurations.delete(key);
     lastPromptInput.delete(key);
   });
 
@@ -184,7 +230,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   ): void => {
     bot.callbackQuery(pattern, async (ctx) => {
       const ctxKey = contextKeyFromCtx(ctx);
-      const messageId = ctx.callbackQuery.message?.message_id;
+      const messageId = ctx.callbackQuery?.message?.message_id;
       const page = Number.parseInt(ctx.match?.[1] ?? "", 10);
       if (!ctxKey || !messageId || Number.isNaN(page)) {
         await ctx.answerCallbackQuery();
@@ -763,14 +809,333 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     }
   };
 
+  const openRemoteCapturePicker = async (ctx: Context): Promise<void> => {
+    const keyboard = new InlineKeyboard()
+      .text("📷 Screenshot", "capture_screenshot")
+      .row()
+      .text("🎥 Video 10s", "capture_video")
+      .row()
+      .text("🎙️ Audio 10s", "capture_audio");
+
+    await safeReply(ctx, "<b>Remote capture:</b> choose a capture type.", {
+      fallbackText: "Remote capture: choose a capture type.",
+      replyMarkup: keyboard,
+    });
+  };
+
+  const handleRemoteCapture = async (ctx: Context, kind: RemoteCaptureKind): Promise<void> => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    const contextKey = contextKeyFromCtx(ctx);
+    const messageThreadId = contextKey ? parseContextKey(contextKey).messageThreadId : undefined;
+    await ctx.answerCallbackQuery({ text: "Working…" });
+
+    const capture = getRemoteCaptureSpec(kind);
+    try {
+      await ctx.api
+        .sendChatAction(chatId, capture.chatAction, {
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+        })
+        .catch(() => {});
+      await runRemoteCaptureCommand(capture.command, capture.args);
+
+      const inputFile = new InputFile(capture.outputPath, capture.filename);
+      if (kind === "screenshot") {
+        await ctx.api.sendPhoto(chatId, inputFile, {
+          caption: "📷 Screenshot",
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+        });
+      } else if (kind === "video") {
+        await ctx.api.sendVideo(chatId, inputFile, {
+          caption: "🎥 Video 10s",
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+        });
+      } else {
+        await ctx.api.sendVoice(chatId, inputFile, {
+          caption: "🎙️ Audio 10s",
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+        });
+      }
+    } catch (error) {
+      const message = formatRemoteCaptureError(kind, error);
+      await sendTextMessage(ctx.api, chatId, `<b>❌ Capture failed:</b> ${escapeHTML(message)}`, {
+        fallbackText: `❌ Capture failed: ${message}`,
+        messageThreadId,
+      });
+    } finally {
+      await unlink(capture.outputPath).catch(() => {});
+    }
+  };
+
+  const openGuardMenu = async (ctx: Context): Promise<void> => {
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!contextKey) {
+      return;
+    }
+
+    pendingGuardDurations.set(contextKey, DEFAULT_SECONDS);
+    await safeReply(ctx, "<b>Guard capture:</b> choose an action.", {
+      fallbackText: "Guard capture: choose an action.",
+      replyMarkup: buildGuardKeyboard(DEFAULT_SECONDS),
+    });
+  };
+
+  const openMacminiMenu = async (ctx: Context): Promise<void> => {
+    const footer = renderMacminiFooter();
+    await safeReply(ctx, `<b>Mac mini remote control</b>\n\n${escapeHTML(footer)}`, {
+      fallbackText: `Mac mini remote control\n\n${footer}`,
+      replyMarkup: buildMacminiKeyboard(),
+    });
+  };
+
+  const handleMacminiCallback = async (ctx: Context): Promise<void> => {
+    const actionId = ctx.match?.[1];
+    const action = actionId ? getMacminiAction(actionId) : undefined;
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery?.message?.message_id;
+    const contextKey = contextKeyFromCtx(ctx);
+    const messageThreadId = contextKey ? parseContextKey(contextKey).messageThreadId : undefined;
+    if (!action || !chatId) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    await ctx.answerCallbackQuery({ text: "Working…" });
+    const status = await sendTextMessage(ctx.api, chatId, escapeHTML(action.runningText), {
+      fallbackText: action.runningText,
+      messageThreadId,
+    });
+
+    const editStatus = async (text: string): Promise<void> => {
+      await safeEditMessage(bot, chatId, status.message_id, escapeHTML(text), { fallbackText: text });
+    };
+
+    try {
+      await action.handler({
+        api: ctx.api,
+        chatId,
+        messageThreadId,
+        env: process.env,
+        editStatus,
+        async replyText(text) {
+          await ctx.api.sendMessage(chatId, text, {
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          });
+        },
+        async sendVideo(file, caption) {
+          await ctx.api.sendVideo(chatId, file, {
+            caption,
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          });
+        },
+        async sendVoice(file, caption) {
+          await ctx.api.sendVoice(chatId, file, {
+            caption,
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          });
+        },
+      });
+      await editStatus(action.doneText);
+    } catch (error) {
+      const message = friendlyErrorText(error);
+      await editStatus(`❌ ${action.label} failed: ${message}`);
+    } finally {
+      if (messageId) {
+        await bot.api
+          .editMessageReplyMarkup(chatId, messageId, { reply_markup: buildMacminiKeyboard() })
+          .catch(() => {});
+      }
+    }
+  };
+
+  const handleYouTubeCommand = async (ctx: Context): Promise<void> => {
+    const chatId = ctx.chat?.id;
+    const text = ctx.message?.text ?? "";
+    const match = text.match(/https?:\/\/(?:www\.)?(?:youtube\.com\/watch\?[^\s]+|youtu\.be\/[A-Za-z0-9_-]{11}[^\s]*)/i);
+    const url = match?.[0];
+    if (!chatId) {
+      return;
+    }
+    if (!url) {
+      await safeReply(ctx, "<b>Usage:</b> <code>/yt &lt;youtube-url&gt;</code>", {
+        fallbackText: "Usage: /yt <youtube-url>",
+      });
+      return;
+    }
+
+    const contextSession = await getContextSession(ctx, { deferThreadStart: true });
+    if (!contextSession) {
+      return;
+    }
+    const { contextKey } = contextSession;
+    if (isBusy(contextKey)) {
+      await sendBusyReply(ctx);
+      return;
+    }
+
+    const busyState = getBusyState(contextKey);
+    busyState.processing = true;
+    const messageThreadId = parseContextKey(contextKey).messageThreadId;
+    const keyboard = new InlineKeyboard().url("▶️ Video", url).row().text("✕ Dismiss", "yt_cancel");
+
+    await setReaction(ctx, "👀");
+    await safeReply(ctx, "<b>YouTube walkthrough:</b> fetching local transcript and building article…", {
+      fallbackText: "YouTube walkthrough: fetching local transcript and building article…",
+      replyMarkup: keyboard,
+    });
+
+    try {
+      await ctx.api
+        .sendChatAction(chatId, "typing", {
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+        })
+        .catch(() => {});
+      const result = await runYouTubeWorkflow(url);
+      const timestampLine = result.clickableTimestamps
+        ? "✅ Clickable timestamps confirmed"
+        : "⚠️ No clickable timestamps found in transcript output";
+      const plain = [
+        "✅ YouTube walkthrough complete",
+        "",
+        `Article: ${result.articlePath}`,
+        `Raw transcript: ${result.rawPath}`,
+        timestampLine,
+        "",
+        result.summary,
+      ].join("\n");
+      const html = [
+        "<b>✅ YouTube walkthrough complete</b>",
+        "",
+        `<b>Article:</b> <code>${escapeHTML(result.articlePath)}</code>`,
+        `<b>Raw transcript:</b> <code>${escapeHTML(result.rawPath)}</code>`,
+        escapeHTML(timestampLine),
+        "",
+        escapeHTML(result.summary),
+      ].join("\n");
+      await sendTextMessage(ctx.api, chatId, html, {
+        parseMode: "HTML",
+        fallbackText: plain,
+        replyMarkup: keyboard,
+        messageThreadId,
+      });
+      await setReaction(ctx, "👍");
+    } catch (error) {
+      await clearReaction(ctx);
+      const message = friendlyErrorText(error);
+      await sendTextMessage(ctx.api, chatId, `<b>❌ YouTube walkthrough failed:</b> ${escapeHTML(message)}`, {
+        parseMode: "HTML",
+        fallbackText: `❌ YouTube walkthrough failed: ${message}`,
+        messageThreadId,
+      });
+    } finally {
+      busyState.processing = false;
+    }
+  };
+
+  const handleGuardDuration = async (ctx: Context): Promise<void> => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery?.message?.message_id;
+    const contextKey = contextKeyFromCtx(ctx);
+    if (!chatId || !messageId || !contextKey) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    const seconds = nextGuardDuration(pendingGuardDurations.get(contextKey) ?? DEFAULT_SECONDS);
+    pendingGuardDurations.set(contextKey, seconds);
+    await ctx.answerCallbackQuery({ text: `Duration: ${seconds}s` });
+    await bot.api.editMessageReplyMarkup(chatId, messageId, {
+      reply_markup: buildGuardKeyboard(seconds),
+    });
+  };
+
+  const handleGuardCancel = async (ctx: Context): Promise<void> => {
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery?.message?.message_id;
+    const contextKey = contextKeyFromCtx(ctx);
+    if (contextKey) {
+      pendingGuardDurations.delete(contextKey);
+    }
+    await ctx.answerCallbackQuery({ text: "Cancelled" });
+    if (chatId && messageId) {
+      await safeEditMessage(bot, chatId, messageId, "<b>Guard capture cancelled.</b>", {
+        fallbackText: "Guard capture cancelled.",
+      });
+    }
+  };
+
+  const handleGuardCapture = async (ctx: Context, kind: GuardCaptureKind): Promise<void> => {
+    const chatId = ctx.chat?.id;
+    if (!chatId) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+
+    const contextKey = contextKeyFromCtx(ctx);
+    const messageThreadId = contextKey ? parseContextKey(contextKey).messageThreadId : undefined;
+    const seconds = contextKey ? pendingGuardDurations.get(contextKey) ?? DEFAULT_SECONDS : DEFAULT_SECONDS;
+    await ctx.answerCallbackQuery({ text: "Working…" });
+
+    const capture = getGuardCaptureSpec(kind, seconds);
+    let outputPath = capture.outputPath;
+    try {
+      await ctx.api
+        .sendChatAction(chatId, capture.chatAction, {
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+        })
+        .catch(() => {});
+      await runGuardCaptureCommand(capture.command, capture.args, capture.timeoutMs);
+      outputPath = await ensureGuardUploadSize(kind, outputPath, seconds);
+      const inputFile = new InputFile(outputPath, capture.filename);
+
+      if (kind === "screenshot") {
+        await ctx.api.sendPhoto(chatId, inputFile, {
+          caption: "📷 Guard screenshot",
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+        });
+      } else if (kind === "video") {
+        await ctx.api.sendVideo(chatId, inputFile, {
+          caption: `🎥 Guard video ${seconds}s`,
+          ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+        });
+      } else {
+        try {
+          await ctx.api.sendVoice(chatId, inputFile, {
+            caption: `🎙️ Guard voice ${seconds}s`,
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          });
+        } catch {
+          await ctx.api.sendAudio(chatId, new InputFile(outputPath, capture.filename), {
+            caption: `🎙️ Guard voice ${seconds}s`,
+            ...(messageThreadId ? { message_thread_id: messageThreadId } : {}),
+          });
+        }
+      }
+    } catch (error) {
+      const message = formatGuardCaptureError(kind, error);
+      await sendTextMessage(ctx.api, chatId, `<b>❌ Guard capture failed:</b> ${escapeHTML(message)}`, {
+        fallbackText: `❌ Guard capture failed: ${message}`,
+        messageThreadId,
+      });
+    } finally {
+      await Promise.all([
+        unlink(capture.outputPath).catch(() => {}),
+        unlink(GUARD_VIDEO_SMALL_PATH).catch(() => {}),
+        unlink(GUARD_AUDIO_SMALL_PATH).catch(() => {}),
+      ]);
+    }
+  };
+
   bot.use(async (ctx, next) => {
     const fromId = ctx.from?.id;
-    if (!fromId || !config.telegramAllowedUserIdSet.has(fromId)) {
-      if (ctx.callbackQuery) {
-        await ctx.answerCallbackQuery({ text: "Unauthorized" }).catch(() => {});
-      } else if (ctx.chat) {
-        await safeReply(ctx, escapeHTML("Unauthorized"), { fallbackText: "Unauthorized" });
-      }
+    const chatId = ctx.chat?.id;
+    const allowedUser = Boolean(fromId && config.telegramAllowedUserIdSet.has(fromId));
+    const allowedChat = Boolean(typeof chatId === "number" && config.telegramAllowedUserIdSet.has(chatId));
+    if (!allowedUser || !allowedChat) {
       return;
     }
 
@@ -969,6 +1334,22 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     await safeReply(ctx, `<b>Voice backends:</b> <code>${escapeHTML(joined)}</code>`, {
       fallbackText: `Voice backends: ${joined}`,
     });
+  });
+
+  bot.command(["capture", "screen"], openRemoteCapturePicker);
+  bot.command("guard", openGuardMenu);
+  bot.command(["macmini", "Macmini", "MACMINI", "macMini"], openMacminiMenu);
+  bot.hears(/^price\s+(.+)/i, handlePriceLookup);
+  bot.command("yt", handleYouTubeCommand);
+  bot.callbackQuery("yt_cancel", async (ctx) => {
+    await ctx.answerCallbackQuery({ text: "Dismissed" });
+    const chatId = ctx.chat?.id;
+    const messageId = ctx.callbackQuery?.message?.message_id;
+    if (chatId && messageId) {
+      await safeEditMessage(bot, chatId, messageId, "<b>YouTube walkthrough message dismissed.</b>", {
+        fallbackText: "YouTube walkthrough message dismissed.",
+      });
+    }
   });
 
   bot.command("new", async (ctx) => {
@@ -1462,6 +1843,29 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
     });
   });
 
+  bot.callbackQuery(/^guard_(screenshot|video|voice)$/, async (ctx) => {
+    const kind = ctx.match?.[1] as GuardCaptureKind | undefined;
+    if (!kind) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    await handleGuardCapture(ctx, kind);
+  });
+
+  bot.callbackQuery("guard_duration", handleGuardDuration);
+  bot.callbackQuery("guard_cancel", handleGuardCancel);
+
+  bot.callbackQuery(/^capture_(screenshot|video|audio)$/, async (ctx) => {
+    const kind = ctx.match?.[1] as RemoteCaptureKind | undefined;
+    if (!kind) {
+      await ctx.answerCallbackQuery();
+      return;
+    }
+    await handleRemoteCapture(ctx, kind);
+  });
+
+  bot.callbackQuery(new RegExp(`^${MACMINI_CALLBACK_PREFIX}([^:]+)$`), handleMacminiCallback);
+
   bot.callbackQuery(NOOP_PAGE_CALLBACK_DATA, async (ctx) => {
     await ctx.answerCallbackQuery();
   });
@@ -1495,7 +1899,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   bot.callbackQuery(/^sess_(\d+)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
-    const messageId = ctx.callbackQuery.message?.message_id;
+    const messageId = ctx.callbackQuery?.message?.message_id;
     const index = Number.parseInt(ctx.match?.[1] ?? "", 10);
 
     if (!chatId || Number.isNaN(index)) {
@@ -1552,7 +1956,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   bot.callbackQuery(/^ws_(\d+)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
-    const messageId = ctx.callbackQuery.message?.message_id;
+    const messageId = ctx.callbackQuery?.message?.message_id;
     const index = Number.parseInt(ctx.match?.[1] ?? "", 10);
 
     if (!chatId || Number.isNaN(index)) {
@@ -1610,7 +2014,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   bot.callbackQuery(/^launch_(\d+)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
-    const messageId = ctx.callbackQuery.message?.message_id;
+    const messageId = ctx.callbackQuery?.message?.message_id;
     const index = Number.parseInt(ctx.match?.[1] ?? "", 10);
 
     if (!chatId || Number.isNaN(index)) {
@@ -1708,7 +2112,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   bot.callbackQuery(/^launchconfirm_(yes|no):([a-z0-9_-]+)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
-    const messageId = ctx.callbackQuery.message?.message_id;
+    const messageId = ctx.callbackQuery?.message?.message_id;
     const action = ctx.match?.[1];
     const confirmedProfileId = ctx.match?.[2];
 
@@ -1787,7 +2191,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   bot.callbackQuery(/^model_(.+)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
-    const messageId = ctx.callbackQuery.message?.message_id;
+    const messageId = ctx.callbackQuery?.message?.message_id;
     const slug = ctx.match?.[1];
 
     if (!chatId || !slug) {
@@ -1844,7 +2248,7 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
 
   bot.callbackQuery(/^effort_(minimal|low|medium|high|xhigh)$/, async (ctx) => {
     const chatId = ctx.chat?.id;
-    const messageId = ctx.callbackQuery.message?.message_id;
+    const messageId = ctx.callbackQuery?.message?.message_id;
     const effort = ctx.match?.[1] as ModelReasoningEffort | undefined;
 
     if (!chatId || !messageId || !effort) {
@@ -2131,6 +2535,17 @@ export function createBot(config: TeleCodexConfig, registry: SessionRegistry): B
   return bot;
 }
 
+function renderMacminiFooter(): string {
+  const totalSeconds = Math.floor(uptime());
+  const days = Math.floor(totalSeconds / 86_400);
+  const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+  const minutes = Math.floor((totalSeconds % 3_600) / 60);
+  const parts = [];
+  if (days > 0) parts.push(`${days}d`);
+  parts.push(`${hours}h`, `${minutes}m`);
+  return `Host: ${hostname()} · Uptime: ${parts.join(" ")}`;
+}
+
 export async function registerCommands(bot: Bot<Context>): Promise<void> {
   await bot.api.setMyCommands([
     { command: "start", description: "Welcome & status" },
@@ -2147,10 +2562,340 @@ export async function registerCommands(bot: Bot<Context>): Promise<void> {
     { command: "login", description: "Start authentication" },
     { command: "logout", description: "Sign out" },
     { command: "voice", description: "Voice transcription status" },
+    { command: "capture", description: "Remote capture controls" },
+    { command: "screen", description: "Alias for remote capture" },
+    { command: "guard", description: "Quick screenshot/video/voice capture" },
+    { command: "macmini", description: "Mac mini remote-control menu" },
     { command: "handback", description: "Hand thread to Codex CLI" },
     { command: "attach", description: "Bind a Codex thread to this topic" },
     { command: "switch", description: "Switch to a thread by ID" },
   ]);
+}
+
+type GuardCaptureSpec = {
+  command: string;
+  args: string[];
+  outputPath: string;
+  filename: string;
+  chatAction: "upload_photo" | "upload_video" | "upload_voice";
+  timeoutMs: number;
+};
+
+function getGuardCaptureSpec(kind: GuardCaptureKind, seconds: number): GuardCaptureSpec {
+  switch (kind) {
+    case "screenshot":
+      return {
+        command: "screencapture",
+        args: ["-x", GUARD_SCREENSHOT_PATH],
+        outputPath: GUARD_SCREENSHOT_PATH,
+        filename: "guard_shot.png",
+        chatAction: "upload_photo",
+        timeoutMs: REMOTE_CAPTURE_TIMEOUT_MS,
+      };
+    case "video":
+      return {
+        command: "ffmpeg",
+        args: [
+          "-y",
+          "-f",
+          "avfoundation",
+          "-framerate",
+          "30",
+          "-i",
+          `${CAM_INDEX}:none`,
+          "-t",
+          String(seconds),
+          "-pix_fmt",
+          "yuv420p",
+          GUARD_VIDEO_PATH,
+        ],
+        outputPath: GUARD_VIDEO_PATH,
+        filename: "guard_vid.mp4",
+        chatAction: "upload_video",
+        timeoutMs: (seconds + 15) * 1000,
+      };
+    case "voice":
+      return {
+        command: "ffmpeg",
+        args: [
+          "-y",
+          "-f",
+          "avfoundation",
+          "-i",
+          `:${MIC_INDEX}`,
+          "-t",
+          String(seconds),
+          "-c:a",
+          "libopus",
+          GUARD_AUDIO_PATH,
+        ],
+        outputPath: GUARD_AUDIO_PATH,
+        filename: "guard_audio.ogg",
+        chatAction: "upload_voice",
+        timeoutMs: (seconds + 15) * 1000,
+      };
+  }
+}
+
+async function runGuardCaptureCommand(command: string, args: string[], timeoutMs: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    execFile(command, args, { timeout: timeoutMs }, (error, _stdout, stderr) => {
+      if (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        reject(new RemoteCaptureCommandError(err.message, stderr));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+async function ensureGuardUploadSize(kind: GuardCaptureKind, outputPath: string, seconds: number): Promise<string> {
+  const size = (await stat(outputPath)).size;
+  if (size <= GUARD_MAX_UPLOAD_BYTES) {
+    return outputPath;
+  }
+
+  if (kind === "video") {
+    await runGuardCaptureCommand(
+      "ffmpeg",
+      [
+        "-y",
+        "-i",
+        outputPath,
+        "-vf",
+        "scale=-2:480",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "32",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "96k",
+        GUARD_VIDEO_SMALL_PATH,
+      ],
+      (seconds + 15) * 1000,
+    );
+    if ((await stat(GUARD_VIDEO_SMALL_PATH)).size <= GUARD_MAX_UPLOAD_BYTES) {
+      await rename(GUARD_VIDEO_SMALL_PATH, outputPath);
+      return outputPath;
+    }
+  }
+
+  if (kind === "voice") {
+    await runGuardCaptureCommand(
+      "ffmpeg",
+      ["-y", "-i", outputPath, "-c:a", "libopus", "-b:a", "24k", GUARD_AUDIO_SMALL_PATH],
+      (seconds + 15) * 1000,
+    );
+    if ((await stat(GUARD_AUDIO_SMALL_PATH)).size <= GUARD_MAX_UPLOAD_BYTES) {
+      await rename(GUARD_AUDIO_SMALL_PATH, outputPath);
+      return outputPath;
+    }
+  }
+
+  throw new Error(`Output is larger than 45 MB and could not be reduced enough for Telegram bot upload.`);
+}
+
+function formatGuardCaptureError(kind: GuardCaptureKind, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const stderr = error instanceof RemoteCaptureCommandError ? error.stderr.trim() : "";
+  const combined = `${message}
+${stderr}`.toLowerCase();
+
+  if (combined.includes("timed out") || combined.includes("timeout")) {
+    return `${guardCaptureLabel(kind)} timed out.`;
+  }
+
+  if (message.includes("ENOENT")) {
+    const binary = kind === "screenshot" ? "screencapture" : "ffmpeg";
+    return `${binary} is not installed or not available in PATH.`;
+  }
+
+  const permission = detectGuardCapturePermission(kind, combined);
+  if (permission) {
+    return `${permission} permission is required. Grant it in System Settings > Privacy & Security, then restart the bot/service.
+
+${stderr || message}`;
+  }
+
+  return stderr || message;
+}
+
+function detectGuardCapturePermission(kind: GuardCaptureKind, combinedOutput: string): string | undefined {
+  const permissionHints = ["not authorized", "not authorised", "permission", "denied", "privacy", "tcc"];
+  const hasPermissionHint = permissionHints.some((hint) => combinedOutput.includes(hint));
+
+  if (kind === "screenshot") {
+    if (hasPermissionHint || combinedOutput.includes("could not create image")) {
+      return "Screen Recording";
+    }
+    return undefined;
+  }
+
+  if (kind === "video") {
+    if (hasPermissionHint || combinedOutput.includes("input/output error")) {
+      return "Camera";
+    }
+    return undefined;
+  }
+
+  if (hasPermissionHint || combinedOutput.includes("input/output error")) {
+    return "Microphone";
+  }
+  return undefined;
+}
+
+function guardCaptureLabel(kind: GuardCaptureKind): string {
+  switch (kind) {
+    case "screenshot":
+      return "Guard screenshot";
+    case "video":
+      return "Guard video";
+    case "voice":
+      return "Guard voice";
+  }
+}
+
+type RemoteCaptureSpec = {
+  command: string;
+  args: string[];
+  outputPath: string;
+  filename: string;
+  chatAction: "upload_photo" | "upload_video" | "upload_voice";
+};
+
+function getRemoteCaptureSpec(kind: RemoteCaptureKind): RemoteCaptureSpec {
+  switch (kind) {
+    case "screenshot":
+      return {
+        command: "screencapture",
+        args: ["-x", REMOTE_CAPTURE_SCREENSHOT_PATH],
+        outputPath: REMOTE_CAPTURE_SCREENSHOT_PATH,
+        filename: "hermes_shot.png",
+        chatAction: "upload_photo",
+      };
+    case "video":
+      return {
+        command: "ffmpeg",
+        args: [
+          "-y",
+          "-f",
+          "avfoundation",
+          "-framerate",
+          "30",
+          "-i",
+          `${REMOTE_CAPTURE_CAMERA_DEVICE_INDEX}:none`,
+          "-t",
+          "10",
+          "-pix_fmt",
+          "yuv420p",
+          REMOTE_CAPTURE_VIDEO_PATH,
+        ],
+        outputPath: REMOTE_CAPTURE_VIDEO_PATH,
+        filename: "hermes_vid.mp4",
+        chatAction: "upload_video",
+      };
+    case "audio":
+      return {
+        command: "ffmpeg",
+        args: [
+          "-y",
+          "-f",
+          "avfoundation",
+          "-i",
+          `:${REMOTE_CAPTURE_AUDIO_DEVICE_INDEX}`,
+          "-t",
+          "10",
+          REMOTE_CAPTURE_AUDIO_PATH,
+        ],
+        outputPath: REMOTE_CAPTURE_AUDIO_PATH,
+        filename: "hermes_audio.m4a",
+        chatAction: "upload_voice",
+      };
+  }
+}
+
+async function runRemoteCaptureCommand(command: string, args: string[]): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    execFile(command, args, { timeout: REMOTE_CAPTURE_TIMEOUT_MS }, (error, _stdout, stderr) => {
+      if (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        reject(new RemoteCaptureCommandError(err.message, stderr));
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+class RemoteCaptureCommandError extends Error {
+  constructor(message: string, readonly stderr: string) {
+    super(message);
+    this.name = "RemoteCaptureCommandError";
+  }
+}
+
+function formatRemoteCaptureError(kind: RemoteCaptureKind, error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  const stderr = error instanceof RemoteCaptureCommandError ? error.stderr.trim() : "";
+  const combined = `${message}
+${stderr}`.toLowerCase();
+
+  if (combined.includes("timed out") || combined.includes("timeout")) {
+    return `${remoteCaptureLabel(kind)} timed out after ${REMOTE_CAPTURE_TIMEOUT_MS / 1000}s.`;
+  }
+
+  if (message.includes("ENOENT")) {
+    const binary = kind === "screenshot" ? "screencapture" : "ffmpeg";
+    return `${binary} is not installed or not available in PATH.`;
+  }
+
+  const permission = detectRemoteCapturePermission(kind, combined);
+  if (permission) {
+    return `${permission} permission is required. Grant it in System Settings > Privacy & Security, then restart the bot/service.`;
+  }
+
+  const detail = stderr || message;
+  return `${remoteCaptureLabel(kind)} command failed. ${detail}`;
+}
+
+function detectRemoteCapturePermission(kind: RemoteCaptureKind, combinedOutput: string): string | undefined {
+  const permissionHints = ["not authorized", "not authorised", "permission", "denied", "privacy", "tcc"];
+  const hasPermissionHint = permissionHints.some((hint) => combinedOutput.includes(hint));
+
+  if (kind === "screenshot") {
+    if (hasPermissionHint || combinedOutput.includes("could not create image")) {
+      return "Screen Recording";
+    }
+    return undefined;
+  }
+
+  if (kind === "video") {
+    if (hasPermissionHint || combinedOutput.includes("input/output error")) {
+      return "Camera";
+    }
+    return undefined;
+  }
+
+  if (hasPermissionHint || combinedOutput.includes("input/output error")) {
+    return "Microphone";
+  }
+  return undefined;
+}
+
+function remoteCaptureLabel(kind: RemoteCaptureKind): string {
+  switch (kind) {
+    case "screenshot":
+      return "Screenshot";
+    case "video":
+      return "Video capture";
+    case "audio":
+      return "Audio capture";
+  }
 }
 
 function renderSessionInfoPlain(info: CodexSessionInfo): string {

@@ -44,6 +44,7 @@ export function renderHelpMessage(): DualText {
         ["/start", "Welcome & status"],
         ["/help", "This reference"],
         ["/voice", "Voice transcription status"],
+        ["/yt <url>", "Local YouTube walkthrough article + Claude summary"],
       ],
     },
   ];
